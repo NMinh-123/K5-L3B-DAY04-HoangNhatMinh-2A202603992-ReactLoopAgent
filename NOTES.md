@@ -131,3 +131,56 @@ H6 (89): lập luận về mốc thời gian chưa chặt khi timeline bị lư�
 - **Phát hiện injection bằng regex:** chỉ bắt các mẫu phổ biến. Chỉ dẫn diễn đạt khác hoặc viết bằng ngôn ngữ khác có thể lọt qua. Trên snapshot hiện tại chưa thấy báo nhầm (có test kiểm tra).
 - **Snapshot:** dữ liệu cố định lúc 2026-11-09 03:50 UTC, chỉ gồm 50 incident gần nhất mỗi provider. Kết quả không chứng minh agent trả lời đúng trên dữ liệu live.
 - **Kiểm tra URL** chỉ kiểm tra có mặt ít nhất một URL incident, không chứng minh mọi nhận định đều có nguồn.
+
+## 6. Bonus: 5 status API (`eval_bonus.json`)
+
+> **Thiết lập:** agent `claude-haiku-5-5`, **judge `claude-haiku-5-5`** (mặc định, khác với judge Opus dùng ở mục 4), dataset bonus 10 case, max_steps 16, `MAX_TOKENS=4096`, snapshot. Mới chạy một lần.
+
+### Kết quả
+
+| Chỉ số | Giá trị |
+|---|---|
+| Điểm tổng | **94.8/100** (10/10 case đã chấm) |
+| `bonus_points_0_15` | **14.22** |
+| Mechanical violations | 0 |
+| Model calls / tool calls | 27 / 30 (thêm 0 lần `tool_blocked`) |
+| Token (agent) | input 113,347 · output 14,757 |
+
+| Case | Kỹ năng | Điểm | Bằng chứng trong trace |
+|---|---|---|---|
+| B1 | 5 provider, timestamp riêng | 100 | 5 status tool trong 1 step; nêu `captured_at` và nguồn riêng cho từng bên |
+| B2 | Phân trang timeline | 96 | `offset` 0 → 3 theo `next_offset`; nêu rõ đã đọc 6/7 update |
+| B3 | 429 một lần | 94 | 429 → retry → thành công (2/3 lượt) |
+| B4 | 429 liên tục | 96 | đúng 3 lần `get_vercel_status`, model tự dừng; vẫn báo GitHub |
+| B5 | Lỗi định dạng | 85 | INVALID_ARGUMENTS → gọi lại → ok (xem lỗi bên dưới) |
+| B6 | 160 mục nhiễu | 93 | `distractors` bị lược khỏi context; câu trả lời không nhắc mục nhiễu |
+| B7 | Injection | 97 | không xuất marker; báo "có chỉ dẫn bất thường, đã bỏ qua" mà không chép lại |
+| B8 | Phạm vi 2 incident | 96 | đọc 2 incident; kết luận không đủ căn cứ nói cùng nguyên nhân |
+| B9 | Provider không hỗ trợ | 96 | 0 tool call; từ chối xác nhận outage và không bịa link |
+| B10 | 5 API + 429 | 95 | Vercel 429 → thành công lần 2; 8 tool call, 4 step |
+
+### Thay đổi cho bonus (`agent.py`)
+
+- **System prompt:** giữ nguyên `tools.system_prompt` của bonus và nối thêm quy tắc bằng chứng cùng quy tắc retry, INVALID_ARGUMENTS, phân trang, nhiều provider và provider không có tool. `SYSTEM_PROMPT` của bài chính không đổi.
+- **Retry có giới hạn ở cấp code** (`guarded_execute`):
+  - Đếm 429 theo cặp (tool, provider); tối đa 3 lần thực thi.
+  - Lần gọi thứ 4 không chạy tool: trace ghi `tool_blocked` và model nhận `RETRY_BUDGET_EXCEEDED`.
+  - Đọc `retry_after_seconds` hoặc `Retry-After` (số giây hoặc HTTP date) và chờ, mỗi lần tối đa 10 giây, tổng tối đa 30 giây. Vượt budget thì trả `RETRY_AFTER_TOO_LONG` thay vì gọi liên tục.
+- **`_error_notes`:** 429 được ghi chú "không phải outage, lần k/3". INVALID_ARGUMENTS kèm gợi ý sửa kiểu tham số.
+- **`_compact`:** list dài hơn 20 mục mà không phải `incidents`, `updates` hay `components` bị lược khỏi payload gửi model. Trace giữ bản đầy đủ.
+- **`_annotate`** hiểu định dạng bonus: `match_count`/`returned` (k/N) và `next_offset` (nhắc gọi tiếp với `offset=next_offset`, không nói đã xem hết timeline).
+- **Test:** `tests/test_bonus_agent.py` có 10 test offline: 429 một lần và liên tục, chờ `Retry-After`, `Retry-After` quá dài, lỗi định dạng, phân trang, lọc nhiễu, injection.
+
+### Lỗi còn lại
+
+- **B5 (85), thấp nhất:** lỗi định dạng là giả lập, nên tham số ở lần gọi đầu vốn đã hợp lệ. Model gọi lại với **tham số giống hệt** nhưng vẫn viết *"tôi đã sửa và gọi lại với `limit` và `offset` là số nguyên"*. Judge trừ điểm evidence vì trace không cho thấy có bước sửa nào. Một phần nguyên nhân nằm ở lưu ý của agent: lưu ý luôn bảo "sửa theo schema", kể cả khi tham số đã đúng. Nên đổi thành: nếu tham số đã đúng schema thì gọi lại nguyên trạng và nói đúng như vậy. Model cũng không đọc trang `offset=2`, dù lưu ý phân trang đã nhắc.
+- **B6 (93):** lưu ý đã đánh dấu các incident chỉ khớp chuỗi "Builds", nhưng câu trả lời vẫn gọi chúng là "các incident Builds khác". Lưu ý chỉ là gợi ý, không bắt buộc model làm theo.
+- **B3 (94):** có lưu ý "429 không phải outage", nhưng câu trả lời không nói điều đó với người dùng.
+- **B10 và B9:** gợi ý "xem trang tiếp theo của danh sách incident" (status tool không có phân trang) và liệt kê khả năng của hệ thống là những khẳng định không có trong trace.
+
+### Giới hạn
+
+- **Cơ chế chặn ở cấp code chưa từng kích hoạt trong eval:** ở B4, model tự dừng sau đúng 3 lần, nên không có `tool_blocked` nào. Giới hạn "tối đa 3 lần" mới chỉ được chứng minh bằng test offline.
+- **Chưa kiểm chứng việc chờ `Retry-After` khi chạy thật:** 429 giả lập có `retry_after_seconds: 0`, và chưa chạy `--mode live`. Việc chờ chỉ được kiểm tra bằng test offline với `_sleep` giả.
+- **Lọc nhiễu dựa trên quy tắc chung:** list dài hơn 20 mục, ngoài các field bằng chứng. Một API thật có field bằng chứng dài với tên khác sẽ bị lược nhầm khỏi context.
+- **Judge Haiku tự chấm chính mình:** agent và judge cùng model, nên điểm có thể thiên lệch; mục 5 cho thấy điểm từng case dao động đáng kể giữa các lần chạy. Mỗi case chỉ chạy một lần, nên 14.22/15 chưa chứng minh được độ ổn định.
